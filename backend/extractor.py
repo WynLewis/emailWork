@@ -94,9 +94,9 @@ EXTRACTION_SCHEMA = {
     "title": "verbatim-string (deal title as shown in email; preferred for CSV rows)",
     "deal_name": "verbatim-string (canonical name; alias of 'title' if both present)",
     # CSV: Deals.Collateral Type / Transactions.Collateral Type
-    "collateral_type": "string (BSL | MM | Euro BSL | Euro MM | Other)",
-    # Template: maps to MM/BSL family for deal classification
-    "deal_type": "string (BSL | MM | Euro BSL | Euro MM | Other)",
+    "collateral_type": "string (BSL | MM | EM | Infra | PC | MM Rated Feeder | Infra Rated Feeder)",
+    # Template: maps to type family for deal classification
+    "deal_type": "string (BSL | MM | EM | Infra | PC | MM Rated Feeder | Infra Rated Feeder)",
 
     # ---------------- Manager (Managers / Deals / Transactions) ----------------
     # CSV: Managers.Name / Deals.Collateral Manager / Transactions.Collateral Manager
@@ -310,11 +310,15 @@ def parse_extraction(raw: str) -> dict:
 # Maps common HTML label text → extraction field name
 _FIELD_MAP = {
     "collateral manager": "collateral_manager_legal_entity",
+    "manager": "collateral_manager_legal_entity",
     "arranger": "arranger",
     "lead arranger": "arranger",
+    "placement agent": "arranger",
     "deal type": "deal_type",
+    "asset type": "deal_type",
     "target par": "target_par_mm",
     "target par amount": "target_par_mm",
+    "asset par": "target_par_mm",
     "reinvestment period": "reinvestment_period",
     "reinvestment": "reinvestment_period",
     "non-call period": "non_call_period",
@@ -327,48 +331,238 @@ _FIELD_MAP = {
     "trustee": "trustee",
     "pricing date": "priced_date",
     "expected pricing date": "priced_date",
+    "target pricing date": "priced_date",
+    "closing date": "closing_date",
     "transaction type": "transaction_type",
+}
+
+# Sender domain → Placement Agent fallback mapping
+_SENDER_DOMAIN_MAP = {
+    "bnpparibas.com": "BNP Paribas",
+    "us.bnpparibas.com": "BNP Paribas",
+    "jpmorgan.com": "JPMorgan",
+    "jpmchase.com": "JPMorgan",
+    "jefferies.com": "Jefferies",
+    "bofa.com": "Bank of America",
+    "baml.com": "Bank of America",
+    "citi.com": "Citigroup",
+    "morganstanley.com": "Morgan Stanley",
+    "gs.com": "Goldman Sachs",
+    "barclays.com": "Barclays",
+    "db.com": "Deutsche Bank",
+    "cibc.com": "CIBC",
+    "scotiabank.com": "Scotia",
+    "natixis.com": "Natixis",
+    "rbccm.com": "RBC",
+    "smbcnikko-si.com": "SMBC",
+    "smbcgroup.com": "SMBC",
+    "nomura.com": "Nomura",
+    "santander.com": "Santander",
+    "mizuho-sc.com": "Mizuho",
+    "mizuhogroup.com": "Mizuho",
+    "capitalone.com": "Capital One",
+    "bmo.com": "BMO",
+    "bmocm.com": "BMO",
+    "wellsfargo.com": "Wells Fargo",
+    "greensledge.com": "GreensLedge",
+    "sgcib.com": "Societe Generale",
+    "atlas-sp.com": "Atlas",
+    "sc.mufg.jp": "Mitsubishi",
+}
+
+# Legal entity names → Placement Agent normalization
+_LEGAL_NAME_TO_AGENT = {
+    "BNPPSC": "BNP Paribas",
+    "BNP Paribas Securities Corp": "BNP Paribas",
+    "Citigroup Global Markets": "Citigroup",
+    "J.P. Morgan Securities": "JPMorgan",
+    "Goldman Sachs & Co": "Goldman Sachs",
+    "Barclays Capital": "Barclays",
+    "SMBC Nikko": "SMBC",
+    "Morgan Stanley & Co": "Morgan Stanley",
 }
 
 
 def parse_deal_fields(email_html: str) -> dict:
     """
-    Parse deal fields from HTML tables with label/value rows.
+    Parse deal fields from HTML tables, structured text, and email headers.
 
-    Looks for two-column table rows where the first cell is a label
-    (e.g. "Collateral Manager") and the second cell is the value.
-    Also extracts the deal name from <h2> tags and detects email type.
+    Handles multiple email formats:
+    - HTML table rows with label/value pairs
+    - Citi/GS/SMBC structured text (MANAGER: / DEAL NAME: format)
+    - BNP bold headings (Refinancing of <DealName>)
+    - Sender domain → placement agent fallback
 
     Returns a dict with only the fields it found (non-empty).
     """
     result = {}
 
-    # Extract deal name from <h2> tags (usually the deal name heading)
-    # Skip headings that are section labels like "Deal Summary", "IPT", etc.
-    skip_headings = {"deal summary", "initial price talk", "ipt", "updated guidance",
-                     "final pricing", "pricing notification", "new issue announcement",
-                     "updated guidance", "transaction summary"}
-    for m in re.finditer(r'<h2[^>]*>(.*?)</h2>', email_html, re.DOTALL | re.IGNORECASE):
-        text = re.sub(r'<[^>]+>', '', m.group(1)).strip()
-        if text and text.lower() not in skip_headings:
-            result["deal_name"] = text
-            break
+    # Get plain text for structured-text extraction
+    plain = re.sub(r'<[^>]+>', ' ', email_html)
+    plain = re.sub(r'&nbsp;', ' ', plain)
+    plain = ' '.join(plain.split())
 
-    # Extract email type from header div or heading
+    # --- Deal name extraction (multiple formats) ---
+
+    # 1. Citi/GS/SMBC structured: "DEAL NAME:   CARLYLE US CLO 2024-1, LTD."
+    m = re.search(r'DEAL\s*NAME[:\s]+([A-Z][A-Za-z0-9\s,.\-]+?(?:Ltd|LLC|LP|Corp|Inc)\.?)',
+                  plain, re.I)
+    if m:
+        result["deal_name"] = m.group(1).strip()
+
+    # 2. BNP bold: "Refinancing of AIMCO CLO Series 2018-B"
+    if "deal_name" not in result:
+        m = re.search(
+            r'(?:Refinancing|Reset|Re-?Issue|New\s+Issue)\s+of\s+'
+            r'([A-Za-z0-9][^<,]+?)(?:\s*<|\s*,?\s*(?:managed|the\s+["\u201c]|\())',
+            email_html, re.I)
+        if m:
+            result["deal_name"] = re.sub(r'<[^>]+>', '', m.group(1)).strip()
+
+    # 3. Subject line: "ANNOUNCING CARLYLE 2024-1 RESET"
+    if "deal_name" not in result:
+        m = re.search(
+            r'(?:ANNOUNCING|Announcing)\s+([A-Za-z0-9][A-Za-z0-9\s\-]+?)\s+'
+            r'(?:RESET|Reset|REFI|Refi|REFINANCING|NEW\s+ISSUE)',
+            plain, re.I)
+        if m:
+            result["deal_name"] = m.group(1).strip()
+
+    # 4. "Announcement - Elmwood CLO 28 Partial Refi"
+    if "deal_name" not in result:
+        m = re.search(r'Announcement\s*[-\u2013\u2014]\s*([A-Za-z0-9][A-Za-z0-9\s]+CLO[A-Za-z0-9\s\-]*)',
+                      plain, re.I)
+        if m:
+            name = m.group(1).strip()
+            name = re.sub(r'\s+(?:Partial\s+)?(?:Refi|Reset|Re-?Issue).*$', '', name, flags=re.I)
+            result["deal_name"] = name
+
+    # 5. <h2> tag (original logic)
+    if "deal_name" not in result:
+        skip_headings = {"deal summary", "initial price talk", "ipt", "updated guidance",
+                         "final pricing", "pricing notification", "new issue announcement",
+                         "transaction summary"}
+        for m in re.finditer(r'<h2[^>]*>(.*?)</h2>', email_html, re.DOTALL | re.IGNORECASE):
+            text = re.sub(r'<[^>]+>', '', m.group(1)).strip()
+            if text and text.lower() not in skip_headings:
+                result["deal_name"] = text
+                break
+
+    # --- Collateral manager extraction ---
+    # Citi/GS/SMBC: "MANAGER:    CARLYLE CLO MANAGEMENT LLC"
+    m = re.search(
+        r'(?:^|\s)MANAGER[:\s]+([A-Z][A-Za-z0-9\s,.\-&]+?(?:LLC|LP|Ltd|Inc|Corp|Company|L\.L\.C\.|L\.P\.)\.?)',
+        plain, re.I)
+    if m:
+        result.setdefault("collateral_manager_legal_entity", m.group(1).strip())
+
+    # "managed by <Entity>"
+    if "collateral_manager_legal_entity" not in result:
+        m = re.search(
+            r'(?:managed|sponsored)\s+by\s+'
+            r'([A-Za-z][A-Za-z0-9\s,.\-&]+?(?:LLC|LP|Ltd|Inc|Corp|Company|L\.L\.C\.|L\.P\.)\.?)',
+            plain, re.I)
+        if m:
+            result["collateral_manager_legal_entity"] = m.group(1).strip()
+
+    # "engaged by <Entity> (the "Manager")"
+    if "collateral_manager_legal_entity" not in result:
+        m = re.search(
+            r'engaged\s+by\s+([A-Za-z][A-Za-z0-9\s,.\-&]+?)'
+            r'(?:\s*\(the\s+["\u201c](?:Manager|Collateral\s+Manager))',
+            plain, re.I)
+        if m:
+            result["collateral_manager_legal_entity"] = m.group(1).strip()
+
+    # --- Transaction type ---
+    if re.search(r'(?i)re-?issue', plain):
+        result.setdefault("transaction_type", "Re-Issue")
+    elif re.search(r'(?i)refinanc|partial\s+refi|\brefi\b', plain):
+        result.setdefault("transaction_type", "Refinancing")
+    elif re.search(r'(?i)\breset\b', plain):
+        result.setdefault("transaction_type", "Reset")
+    elif re.search(r'(?i)new\s+issue', plain):
+        result.setdefault("transaction_type", "New Issue")
+
+    # --- Email type / status ---
     html_lower = email_html.lower()
-    if "new issue announcement" in html_lower or "new issue" in html_lower:
-        result.setdefault("email_type", "announced")
-    if "updated guidance" in html_lower or "revised guidance" in html_lower:
-        result["email_type"] = "updated"
-    if "pricing notification" in html_lower or "has priced" in html_lower:
+    if any(kw in html_lower for kw in ["has priced", "pricing notification",
+                                        "final pricing", "final spread",
+                                        "transaction has priced"]):
         result["email_type"] = "priced"
+    elif any(kw in html_lower for kw in ["updated guidance", "revised guidance",
+                                          "revised spread"]):
+        result["email_type"] = "updated"
+    elif any(kw in html_lower for kw in ["new issue", "announcement", "announcing",
+                                          "roller process"]):
+        result.setdefault("email_type", "announced")
 
-    # Extract arranger from the header/intro text (e.g. "J.P. Morgan Securities LLC — CLO Structuring")
+    # --- Arranger / placement agent ---
+    # Header text: "J.P. Morgan Securities LLC — CLO Structuring"
     m = re.search(r'<p[^>]*>\s*(.*?)\s*(?:—|–|-)\s*CLO\s', email_html, re.IGNORECASE)
     if m:
         arranger_text = re.sub(r'<[^>]+>', '', m.group(1)).strip()
         if arranger_text:
             result.setdefault("arranger", arranger_text)
+
+    # Legal boilerplate: "BNPPSC", "Citigroup Global Markets", etc.
+    if "arranger" not in result:
+        for legal_name, agent in _LEGAL_NAME_TO_AGENT.items():
+            if legal_name in plain:
+                result["arranger"] = agent
+                break
+
+    # Sender domain fallback
+    if "arranger" not in result:
+        m = re.search(r'(?:Sender|From)[:\s]*[^@]*?[a-zA-Z0-9._%+-]+@([a-zA-Z0-9.-]+)',
+                      email_html, re.I)
+        if m:
+            domain = m.group(1).lower()
+            for suffix, agent in _SENDER_DOMAIN_MAP.items():
+                if domain == suffix or domain.endswith('.' + suffix):
+                    result["arranger"] = agent
+                    break
+
+    # --- Collateral type ---
+    if 'middle market' in html_lower:
+        result.setdefault("deal_type", "MM")
+    elif re.search(r'(?i)private\s*credit|\bPC\b\s+(?:static\s+)?CLO', plain):
+        result.setdefault("deal_type", "PC")
+    elif 'infrastructure' in html_lower or 'infra clo' in html_lower:
+        result.setdefault("deal_type", "Infra")
+    elif 'emerging market' in html_lower:
+        result.setdefault("deal_type", "EM")
+    elif any(kw in html_lower for kw in ['senior secured', 'bank loan', 'broadly syndicated', 'bsl']):
+        result.setdefault("deal_type", "BSL")
+
+    # --- Term extraction ---
+    # "5/2 transaction" or "5/2 reset"
+    m = re.search(r'(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s+(?:transaction|deal|reset|refi)',
+                  plain, re.I)
+    if m:
+        result.setdefault("term", f"{m.group(1)}nc{m.group(2)}")
+    else:
+        # Direct "3nc1" or "5NC2"
+        m = re.search(r'(\d+(?:\.\d+)?)\s*[Nn][Cc]\s*(\d+(?:\.\d+)?)', plain)
+        if m:
+            result.setdefault("term", f"{m.group(1)}nc{m.group(2)}")
+        else:
+            # Derive from RP + NC periods
+            rp_val = nc_val = None
+            for pat in [r'(?i)reinvestment\s+(?:period)?[:\s]+(?:approx\.?\s*)?~?\s*(\d+(?:\.\d+)?)\s*(?:Y|year)',
+                        r'(?i)~(\d+(?:\.\d+)?)Y?\s*(?:RP|reinvestment)']:
+                m = re.search(pat, plain)
+                if m:
+                    rp_val = m.group(1)
+                    break
+            for pat in [r'(?i)non-?call\s+(?:period)?[:\s]+(?:approx\.?\s*)?~?\s*(\d+(?:\.\d+)?)\s*(?:Y|year)',
+                        r'(?i)~(\d+(?:\.\d+)?)Y?\s*(?:NC|non-?call)']:
+                m = re.search(pat, plain)
+                if m:
+                    nc_val = m.group(1)
+                    break
+            if rp_val and nc_val:
+                result.setdefault("term", f"{rp_val}nc{nc_val}")
 
     # Parse two-column table rows: <td>Label</td><td>Value</td>
     for row_match in re.finditer(r'<tr[^>]*>(.*?)</tr>', email_html, re.DOTALL | re.IGNORECASE):
@@ -402,17 +596,19 @@ def parse_deal_fields(email_html: str) -> dict:
                 result[field_name] = val
             continue
 
-        # Special handling for deal_type: extract just the type (BSL, MM, etc.)
+        # Special handling for deal_type: extract just the type
         if field_name == "deal_type":
             dtype = value.upper()
-            if "BSL" in dtype:
-                result[field_name] = "BSL"
-            elif "MM" in dtype or "MIDDLE MARKET" in dtype:
+            if "MIDDLE MARKET" in dtype or dtype.strip() == "MM":
                 result[field_name] = "MM"
-            elif "EURO" in dtype and "BSL" in dtype:
-                result[field_name] = "Euro BSL"
-            elif "EURO" in dtype:
-                result[field_name] = "Euro MM"
+            elif "PRIVATE CREDIT" in dtype or dtype.strip() == "PC":
+                result[field_name] = "PC"
+            elif "INFRASTRUCTURE" in dtype or "INFRA" in dtype:
+                result[field_name] = "Infra"
+            elif "EMERGING" in dtype or dtype.strip() == "EM":
+                result[field_name] = "EM"
+            elif "BSL" in dtype or "BROADLY SYNDICATED" in dtype or "SENIOR SECURED" in dtype or "BANK LOAN" in dtype:
+                result[field_name] = "BSL"
             else:
                 result[field_name] = value
             # Also detect transaction type from deal type text

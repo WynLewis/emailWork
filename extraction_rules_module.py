@@ -70,10 +70,8 @@ def extract_from_email(
         suggestions = []
         rules_section = rules.get(section, {})
         ruleset = rules_section.get(field_type, {})
-        # Allowed values
-        if 'allowed_values' in ruleset:
-            suggestions.extend(ruleset['allowed_values'])
-        # Extraction patterns
+        allowed = ruleset.get('allowed_values', []) if isinstance(ruleset, dict) else []
+        # Extraction patterns — match against content first
         if 'extraction_patterns' in ruleset:
             for pat in ruleset['extraction_patterns']:
                 if isinstance(pat, dict):
@@ -99,6 +97,11 @@ def extract_from_email(
                     m = re.search(pat, combined, re.I)
                     if m:
                         suggestions.append(m.group(1) if m.groups() else m.group(0))
+        # Validate extracted values against allowed_values if defined
+        if allowed and suggestions:
+            validated = [s for s in suggestions if s in allowed]
+            if validated:
+                return validated
         return suggestions
 
     # --- Deal fields ---

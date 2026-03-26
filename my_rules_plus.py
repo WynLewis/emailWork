@@ -138,7 +138,7 @@ def _get_field_from_yaml(rules: Dict[str, Any], section: str, field: str,
                          *, text: str, filename: Optional[str]) -> Optional[str]:
     sec = rules.get(section, {}) or {}
     spec = sec.get(field, {}) or {}
-    patterns = spec.get('extraction_patterns') or spec.get('extraction\_patterns')
+    patterns = spec.get('extraction_patterns')
     val = _search_first_match(patterns or [], text, filename=filename)
     if (val is None or val == '') and 'default' in spec:
         defval = spec.get('default')
@@ -205,7 +205,7 @@ def _enrich_from_manager_catalog(fields: Dict[str, Any]) -> None:
     mgr = fields.get('Collateral Manager')
     if not mgr:
         return
-    mgr_path = os.getenv('CLO_CSV_MANAGERS', 'clo-managers.csv')
+    mgr_path = os.getenv('CLO_CSV_MANAGERS', os.path.join(os.path.dirname(__file__), 'data', 'csv', 'clo-managers.csv'))
     rows = _read_csv_dict(mgr_path)
     if not rows:
         return
@@ -228,7 +228,7 @@ def _enrich_from_deals_catalog(fields: Dict[str, Any]) -> None:
     title = fields.get('Title')
     if not title:
         return
-    deals_path = os.getenv('CLO_CSV_DEALS', 'clo-deals.csv')
+    deals_path = os.getenv('CLO_CSV_DEALS', os.path.join(os.path.dirname(__file__), 'data', 'csv', 'clo-deals.csv'))
     rows = _read_csv_dict(deals_path)
     if not rows:
         return
@@ -298,14 +298,18 @@ def extract_from_email(email_text: str) -> dict:
         norm = ctype.strip()
         out['Collateral Type'] = norm
         low = norm.lower()
-        if 'middle' in low and 'market' in low:
+        if 'middle' in low and 'market' in low or low == 'mm':
             out['deal_type'] = 'MM'
-        elif 'bsl' in low:
+        elif 'private credit' in low or low == 'pc':
+            out['deal_type'] = 'PC'
+        elif 'infra' in low:
+            out['deal_type'] = 'Infra'
+        elif 'emerging' in low or low == 'em':
+            out['deal_type'] = 'EM'
+        elif 'bsl' in low or 'broadly syndicated' in low or 'senior secured' in low:
             out['deal_type'] = 'BSL'
-        elif 'euro' in low:
-            out['deal_type'] = 'Euro MM' if 'middle' in low else 'Euro BSL'
         else:
-            out['deal_type'] = 'Other'
+            out['deal_type'] = norm
 
     # Placement Agent / Arranger
     arranger = _get_field_from_yaml(rules, 'transactions', 'placement_agent', text=combined, filename=filename)

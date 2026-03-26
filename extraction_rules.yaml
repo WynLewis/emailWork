@@ -1,6 +1,9 @@
 # CLO Email Extraction Rules
-# Version: 1.0
-# Last Updated: 2026-03-19
+# Version: 2.0
+# Last Updated: 2026-03-26
+#
+# Enhanced with patterns from 10 real emails (BNP, Citi, Barclays, GS, SMBC)
+# and validated against 2200+ deals, 220+ managers, 21000+ transactions.
 
 # =============================================================================
 # DEALS FIELDS
@@ -9,31 +12,66 @@ deals:
   title:
     description: "Deal name without transaction type prefix"
     extraction_patterns:
-      - pattern: '(?:Refinancing|Reset|Re-Issue|New Issue)\s+of\s+(.+?)(?:\s*</|\s*$)'
+      # Citi/GS/SMBC structured format: "DEAL NAME:   CARLYLE US CLO 2024-1, LTD."
+      - pattern: '(?:DEAL\s*NAME|Deal\s*Name)[:\s]+([A-Z][A-Za-z0-9\s,.\-]+(?:Ltd|LLC|LP|Corp|Inc)\.?)'
         group: 1
-      - pattern: '<b[^>]*>([^<]+CLO[^<]+)</b>'
+      # BNP bold format: <b>Refinancing of AIMCO CLO Series 2018-B</b>
+      - pattern: '(?:Refinancing|Reset|Re-?Issue|New Issue)\s+of\s+([A-Za-z0-9][^<,]+?)(?:\s*<|\s*,?\s*(?:managed|the\s+"|\())'
+        group: 1
+      # Subject line: "*** CLO PRIMARY: ANNOUNCING CARLYLE 2024-1 RESET ***"
+      - pattern: '(?:ANNOUNCING|Announcing)\s+([A-Za-z0-9][A-Za-z0-9\s\-]+?)\s+(?:RESET|Reset|REFI|Refi|NEW\s+ISSUE)'
+        group: 1
+      # Subject line: "Announcement - Elmwood CLO 28 Partial Refi"
+      - pattern: 'Announcement\s*[-–—]\s*([A-Za-z0-9][A-Za-z0-9\s]+CLO[A-Za-z0-9\s\-]*)'
+        group: 1
+      # Bold deal name in BNP format: <b><span>Refinancing of AIMCO CLO Series 2018-B</span></b>
+      - pattern: '<b[^>]*>\s*(?:<[^>]+>\s*)*(?:Refinancing|Reset|Re-?Issue|New Issue)\s+of\s+([^<]+?)(?:\s*<)'
+        group: 1
+      # Generic bold CLO name
+      - pattern: '<b[^>]*>\s*(?:<[^>]+>\s*)*([^<]*CLO[^<]*?)(?:\s*<)'
         group: 1
     transformations:
-      - strip_prefixes: ["Refinancing of ", "Reset of ", "Re-Issue of "]
+      - strip_prefixes: ["Refinancing of ", "Reset of ", "Re-Issue of ", "New Issue of ", "Pricing of "]
       - trim_whitespace: true
+      - strip_suffixes: [", Ltd.", ", LLC", " Ltd.", " LLC", " LP"]
     confidence: high
 
   collateral_type:
-    description: "BSL or Middle Market"
+    description: "BSL, MM, EM, Infra, PC, MM Rated Feeder, Infra Rated Feeder"
     default: "BSL"
+    allowed_values: ["BSL", "MM", "EM", "Infra", "PC", "MM Rated Feeder", "Infra Rated Feeder"]
     extraction_patterns:
       - pattern: '(?i)middle\s*market'
-        value_if_match: "Middle Market"
-        value_if_no_match: "BSL"
-    lookup_table: "managers_collateral_type.json"
+        value_if_match: "MM"
+      - pattern: '(?i)(?:asset\s+type|collateral\s+type)[:\s]+.*?middle\s*market'
+        value_if_match: "MM"
+      - pattern: '(?i)private\s*credit|(?:PC|pc)\s+(?:static\s+)?CLO'
+        value_if_match: "PC"
+      - pattern: '(?i)infrastructure|infra\s+CLO'
+        value_if_match: "Infra"
+      - pattern: '(?i)emerging\s*market'
+        value_if_match: "EM"
+      - pattern: '(?i)(?:broadly\s+syndicated|BSL|senior\s+secured\s+(?:bank\s+)?loans)'
+        value_if_match: "BSL"
     confidence: medium
 
   collateral_manager:
     description: "Full legal entity name of CLO manager"
     extraction_patterns:
-      - pattern: 'managed by\s+([^.<]+(?:LLC|LP|Ltd|Inc|Corp)[^.<]*)'
+      # Citi/GS/SMBC structured: "MANAGER:    CARLYLE CLO MANAGEMENT LLC"
+      - pattern: '(?:MANAGER|Manager|Collateral\s+Manager)[:\s]+([A-Z][A-Za-z0-9\s,.\-&]+(?:LLC|LP|Ltd|Inc|Corp|Company|L\.L\.C\.|L\.P\.)\.?)'
         group: 1
-      - pattern: 'managed by\s+([^.]+)\.'
+      # BNP/Barclays body text: "managed by Allstate Investment Management Company"
+      - pattern: '(?:managed|sponsored)\s+by\s+([A-Za-z][A-Za-z0-9\s,.\-&]+?(?:LLC|LP|Ltd|Inc|Corp|Company|L\.L\.C\.|L\.P\.)\.?)'
+        group: 1
+      # Structured table row: "Collateral Manager" label with value
+      - pattern: 'Collateral\s+Manager[:\s</td>]+(?:<[^>]+>)*\s*([A-Za-z][A-Za-z0-9\s,.\-&]+?(?:LLC|LP|Ltd|Inc|Corp|Company|L\.L\.C\.|L\.P\.)\.?)'
+        group: 1
+      # Legal boilerplate: "engaged by XXXX (the "Manager")"
+      - pattern: 'engaged\s+by\s+([A-Za-z][A-Za-z0-9\s,.\-&]+?)(?:\s*\(the\s+["\u201c](?:Manager|Collateral\s+Manager))'
+        group: 1
+      # Fallback: "managed by <name>." without entity suffix
+      - pattern: 'managed\s+by\s+([A-Za-z][A-Za-z0-9\s,.\-&]+?)(?:\s*[.(])'
         group: 1
     transformations:
       - trim_whitespace: true
@@ -42,6 +80,10 @@ deals:
 
   bloomberg_deal_name:
     description: "Abbreviated deal identifier for Bloomberg"
+    extraction_patterns:
+      # Sometimes appears in bold as ticker: "ALLEG 2024-1"
+      - pattern: '<b[^>]*>\s*(?:<[^>]+>\s*)*([A-Z]{2,10}\s+\d{4}-\d{1,3}[A-Za-z]?)(?:\s*<)'
+        group: 1
     derivation_rules:
       - source: title
       - abbreviate_manager: true
@@ -71,27 +113,40 @@ transactions:
     description: "Type of CLO transaction"
     allowed_values: ["New Issue", "Reset", "Refinancing", "Re-Issue"]
     extraction_patterns:
-      - pattern: '(?i)refinancing\s+of'
+      # Order matters — check specific patterns before generic
+      - pattern: '(?i)re-?issue\s+of'
+        value: "Re-Issue"
+      - pattern: '(?i)refinanc(?:ing|e)\s+of|partial\s+refi|CLO\s+Refi'
         value: "Refinancing"
-      - pattern: '(?i)reset\s+of'
+      - pattern: '(?i)reset\s+(?:of\s+|transaction\s+)?(?:managed|[A-Z])|announcing\s+\S+\s+reset|\breset\b\s+(?:\d|5/2|3/1)'
         value: "Reset"
       - pattern: '(?i)re-?issue'
         value: "Re-Issue"
+      - pattern: '(?i)refinanc'
+        value: "Refinancing"
+      - pattern: '(?i)\breset\b'
+        value: "Reset"
       - pattern: '(?i)new\s+issue|pricing\s+of(?!\s+refinancing|\s+reset)'
         value: "New Issue"
-    priority_order: ["Refinancing", "Reset", "Re-Issue", "New Issue"]
+    priority_order: ["Re-Issue", "Refinancing", "Reset", "New Issue"]
     confidence: high
 
   status:
     description: "Current deal status"
     allowed_values: ["Announced", "Priced", "Upcoming", "Cancelled"]
     extraction_patterns:
-      - pattern: '(?i)has\s+priced'
+      - pattern: '(?i)has\s+priced|pricing\s+notification|final\s+(?:spread|pricing)'
         value: "Priced"
-      - pattern: '(?i)pricing\s+(?:details|summary)'
+      - pattern: '(?i)pricing\s+(?:details|summary)|transaction\s+has\s+priced'
         value: "Priced"
-      - pattern: '(?i)announces|announcing|will\s+price'
+      - pattern: '(?i)updated\s+guidance|revised\s+(?:guidance|spread)'
         value: "Announced"
+      - pattern: '(?i)announc(?:es?|ing|ement)|will\s+price|roller\s+(?:process|deadline)'
+        value: "Announced"
+      - pattern: '(?i)upcoming|pipeline|calendar'
+        value: "Upcoming"
+      - pattern: '(?i)cancel|withdrawn|postponed'
+        value: "Cancelled"
     confidence: high
 
   placement_agent:
@@ -122,18 +177,46 @@ transactions:
       - "Atlas"
       - "Societe Generale"
     extraction_patterns:
+      # "<Bank> has priced" in pricing emails
       - pattern: '(BNP Paribas|JPMorgan|Jefferies|Bank of America|Citigroup|Morgan Stanley|Goldman Sachs|Wells Fargo|Barclays|Deutsche Bank|CIBC|Scotia|Natixis|RBC|SMBC|Nomura|Santander|Mizuho|Capital One|BMO|Atlas|Societe Generale|GreensLedge|Mitsubishi)\s+has\s+priced'
         group: 1
+      # "engaged by ... to act as ... placement ... agent"
+      - pattern: '(?:engaged|retained)\s+(?:by\s+)?(?:[^.]*?)(BNP Paribas|BNPPSC|JPMorgan|J\.P\.\s*Morgan|Jefferies|Bank of America|Citigroup|Citigroup Global Markets|Morgan Stanley|Goldman Sachs|Wells Fargo|Barclays|Deutsche Bank|CIBC|Scotia|Natixis|RBC|SMBC|Nomura|Santander|Mizuho|Capital One|BMO|Atlas|Societe Generale|GreensLedge|Mitsubishi)[^.]*(?:placement|structur(?:ing|er))\s+(?:and\s+)?(?:structuring\s+)?agent'
+        group: 1
+      # "from <Bank>" in forwarded emails
       - pattern: 'from\s+(BNP Paribas|JPMorgan|Jefferies|Bank of America|Citigroup|Morgan Stanley|Goldman Sachs|Wells Fargo|Barclays|Deutsche Bank|CIBC|Scotia|Natixis|RBC|SMBC|Nomura|Santander|Mizuho|Capital One|BMO|Atlas|Societe Generale|GreensLedge|Mitsubishi)'
         group: 1
     fallback_from_sender_domain:
       "bnpparibas.com": "BNP Paribas"
+      "us.bnpparibas.com": "BNP Paribas"
       "jpmorgan.com": "JPMorgan"
+      "jpmchase.com": "JPMorgan"
       "jefferies.com": "Jefferies"
       "bofa.com": "Bank of America"
+      "baml.com": "Bank of America"
       "citi.com": "Citigroup"
       "morganstanley.com": "Morgan Stanley"
       "gs.com": "Goldman Sachs"
+      "barclays.com": "Barclays"
+      "db.com": "Deutsche Bank"
+      "cibc.com": "CIBC"
+      "scotiabank.com": "Scotia"
+      "natixis.com": "Natixis"
+      "rbccm.com": "RBC"
+      "smbcnikko-si.com": "SMBC"
+      "smbcgroup.com": "SMBC"
+      "nomura.com": "Nomura"
+      "santander.com": "Santander"
+      "mizuho-sc.com": "Mizuho"
+      "mizuhogroup.com": "Mizuho"
+      "capitalone.com": "Capital One"
+      "bmo.com": "BMO"
+      "bmocm.com": "BMO"
+      "wellsfargo.com": "Wells Fargo"
+      "greensledge.com": "GreensLedge"
+      "sgcib.com": "Societe Generale"
+      "atlas-sp.com": "Atlas"
+      "sc.mufg.jp": "Mitsubishi"
     confidence: high
 
   priced_date:
@@ -145,30 +228,51 @@ transactions:
       - pattern: '(?i)priced\s+(?:on\s+)?(\w+\s+\d{1,2},?\s+\d{4})'
         group: 1
         transform: parse_date
-    format: "YYYY-MM-DDTHH:mm:ssZ"
+      - pattern: '(?i)(?:target\s+)?pricing\s+date[:\s]+(\w+\s+\d{1,2},?\s+\d{4})'
+        group: 1
+        transform: parse_date
+    format: "YYYY-MM-DD"
     confidence: high
 
   announcement_date:
     description: "Date deal was announced"
     extraction_patterns:
+      - source: filename
+        pattern: '(\d{4}-\d{2}-\d{2})'
+        group: 1
       - pattern: '(?i)announced\s+(?:on\s+)?(\w+\s+\d{1,2},?\s+\d{4})'
         group: 1
     default: null
 
   term:
-    description: "Deal term structure (e.g., 3nc1)"
+    description: "Deal term structure — RPncCP (e.g., 5nc2, 3nc1, 0.5nc0.5)"
+    extraction_patterns:
+      # Direct term in subject/text: "5/2 transaction" or "5nc2" or "3nc1"
+      - pattern: '(?i)(?:^|\s)(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s+(?:transaction|deal|reset|refi)'
+        group: 0
+        transform: term_from_slash
+      - pattern: '(?i)(\d+(?:\.\d+)?[Nn][Cc]\d+(?:\.\d+)?)'
+        group: 1
+      # "3nc1" or "5NC2" in subject line
+      - pattern: '(\d+(?:\.\d+)?)\s*nc\s*(\d+(?:\.\d+)?)'
+        group: 0
+        transform: term_from_nc
     derivation_rules:
       calculation: |
-        reinvest_years = (reinvest_end_date - closing_date).years
-        noncall_years = (noncall_end_date - closing_date).years
+        reinvest_years = parse_period(reinvestment_period)
+        noncall_years = parse_period(non_call_period)
         term = f"{reinvest_years}nc{noncall_years}"
-    date_extraction:
-      closing_date:
-        pattern: '(?i)closing\s+date[:\s]+(\w+\s+\d{1,2},?\s+\d{4})'
-      reinvestment_end:
-        pattern: '(?i)reinvestment\s+(?:period\s+)?end\s+date[:\s]+(\w+\s+\d{1,2},?\s+\d{4})'
-      noncall_end:
-        pattern: '(?i)non-?call\s+(?:period\s+)?end\s+date[:\s]+(\w+\s+\d{1,2},?\s+\d{4})'
+    period_extraction:
+      reinvestment_period:
+        patterns:
+          - '(?i)reinvestment\s+(?:period)?[:\s]+(?:(?:approx\.?\s*)?~?\s*(\d+(?:\.\d+)?)\s*(?:Y(?:ears?)?|yr))'
+          - '(?i)reinvestment\s+(?:period)?[:\s]+(?:approx\.?\s*)?(\d+)\s+years'
+          - '(?i)~(\d+(?:\.\d+)?)Y\s*(?:RP|reinvestment)'
+      non_call_period:
+        patterns:
+          - '(?i)non-?call\s+(?:period)?[:\s]+(?:(?:approx\.?\s*)?~?\s*(\d+(?:\.\d+)?)\s*(?:Y(?:ears?)?|yr))'
+          - '(?i)non-?call\s+(?:period)?[:\s]+(?:approx\.?\s*)?(\d+)\s+years'
+          - '(?i)~(\d+(?:\.\d+)?)Y\s*(?:NC|non-?call)'
     confidence: high
 
   engaged:
@@ -191,9 +295,9 @@ transactions:
 # =============================================================================
   final_pricing_details:
     description: "Formatted pricing summary per tranche"
-    
+
     output_format: "<Class Name> (<Rating>) @ <DM> DM"
-    
+
     # Rating Conversion (Moody's → S&P)
     rating_conversion:
       Aaa: "AAA"
@@ -217,7 +321,7 @@ transactions:
       Caa3: "CCC"
       Ca: "CC"
       C: "C"
-    
+
     # Strip these from ratings
     rating_strip_patterns:
       - "(sf)"
@@ -226,7 +330,7 @@ transactions:
       - "+"
       - "-"
       - " "
-    
+
     # AAA Seniority Rules
     aaa_rules:
       description: "AAA notes use Sr/Jr labeling, never aggregate"
@@ -240,7 +344,7 @@ transactions:
       loan_handling: "exclude_from_display"
       aggregation: false
       format_example: "A-1-R (Sr AAA) @ 117 DM"
-    
+
     # Non-AAA Aggregation Rules
     non_aaa_rules:
       description: "AA and below aggregate to single par-weighted DM per rating bucket"
@@ -249,7 +353,7 @@ transactions:
       rounding: "nearest_bp"
       display_format: "<Rating> (<Rating>) @ <WA_DM> DM"
       format_example: "AA (AA) @ 160 DM"
-    
+
     # Display Exclusions
     exclusions:
       - pattern: "^X"
@@ -260,7 +364,7 @@ transactions:
         reason: "Loan tranches excluded from display"
       - condition: "no_dm_available"
         reason: "Cannot infer DM"
-    
+
     # DM Inference Logic
     dm_inference:
       priority_order:
@@ -273,7 +377,7 @@ transactions:
           description: "Fixed coupon - 3M SOFR"
           condition: "no_explicit_dm"
           sofr_reference: "latest_3m_sofr"
-    
+
     # Output Ordering
     sort_order:
       - "Sr AAA"
@@ -311,12 +415,15 @@ table_extraction:
   html_table:
     headers:
       class_name: ["Class", "Tranche", "Name"]
-      rating: ["S&P", "Moody's", "Fitch", "Rating", "S&P / M / F"]
+      rating: ["S&P", "Moody's", "Fitch", "Rating", "S&P / M / F", "Moody's/Fitch"]
       size: ["Size", "Amount", "Par", "Balance"]
-      subordination: ["Subordination", "Sub", "Credit Enhancement"]
-      coupon: ["Coupon", "Spread", "Rate", "SOFR +"]
+      subordination: ["Subordination", "Sub", "Credit Enhancement", "Par Sub"]
+      coupon: ["Coupon", "Spread", "Rate", "SOFR +", "Flt/Fix"]
       dm: ["DM", "Discount Margin", "SOFR +"]
-    
+      guidance: ["Guidance", "Guidance/Status", "IPT", "Spread"]
+      wal: ["WAL"]
+      mvoc: ["MVOC"]
+
     size_parsing:
       strip_characters: ["$", ",", " "]
       multipliers:
