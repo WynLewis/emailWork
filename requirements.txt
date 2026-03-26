@@ -1,0 +1,14 @@
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+filelock>=3.13.0
+anthropic>=0.39.0
+boto3>=1.34.0
+transformers>=4.40.0
+torch>=2.0.0
+peft>=0.10.0
+accelerate>=0.28.0
+python-dotenv>=1.0.0
+ipython>=8.0.0
+ipykernel>=6.0.0
+ipywidgets>=8.0.0
