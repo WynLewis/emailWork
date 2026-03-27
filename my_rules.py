@@ -554,4 +554,111 @@ def extract_from_email(email_text: str) -> dict:
         else:
             result['announced_date'] = date_str
 
+    # --- Map template fields → SharePoint CSV column names ---
+    _map_to_csv_columns(result)
+
     return result
+
+
+# ---------------------------------------------------------------------------
+# CSV column mapping and catalog enrichment
+# ---------------------------------------------------------------------------
+# Maps extraction template keys to SharePoint list column names so downstream
+# code can write directly into clo-deals, clo-managers, clo-transactions.
+
+DEALS_COLUMNS = [
+    'Title', 'Collateral Type', 'Collateral Manager',
+    'Bloomberg Deal Name', 'Intex Deal', 'Intex Preprice', 'Deal Documents'
+]
+MANAGERS_COLUMNS = [
+    'Name', 'Short Name', 'Ultimate Parent', 'CRD Number', 'SEC Number', 'Website'
+]
+TRANSACTIONS_COLUMNS = [
+    'Engaged', 'Executed', 'Deal', 'IPT', 'Final Pricing Details', 'Placement Agent',
+    'Term', 'Transaction Type', 'Status', 'Announcement Date', 'Priced Date',
+    'Title', 'Collateral Type', 'Collateral Manager'
+]
+
+
+def _map_to_csv_columns(result: dict) -> None:
+    """Add SharePoint CSV column names alongside template field names."""
+    # Deals columns
+    if result.get('deal_name'):
+        result.setdefault('Title', result['deal_name'])
+        result.setdefault('Deal', result['deal_name'])
+    if result.get('collateral_manager_legal_entity'):
+        result.setdefault('Collateral Manager', result['collateral_manager_legal_entity'])
+        result.setdefault('Name', result['collateral_manager_legal_entity'])
+    if result.get('collateral_type'):
+        result.setdefault('Collateral Type', result['collateral_type'])
+    if result.get('collateral_manager_short'):
+        result.setdefault('Short Name', result['collateral_manager_short'])
+
+    # Transaction columns
+    if result.get('arranger'):
+        result.setdefault('Placement Agent', result['arranger'])
+    if result.get('transaction_type'):
+        result.setdefault('Transaction Type', result['transaction_type'])
+    if result.get('email_type'):
+        status = result['email_type']
+        result.setdefault('Status', status.capitalize() if status != 'priced' else 'Priced')
+    if result.get('term'):
+        result.setdefault('Term', result['term'])
+    if result.get('priced_date'):
+        result.setdefault('Priced Date', result['priced_date'])
+    if result.get('announced_date'):
+        result.setdefault('Announcement Date', result['announced_date'])
+
+    # Booleans default to False
+    result.setdefault('Engaged', False)
+    result.setdefault('Executed', False)
+
+    # Enrich from manager catalog (fills Short Name, Ultimate Parent, etc.)
+    _enrich_from_manager_catalog(result)
+
+    # Enrich from deals catalog (fills Bloomberg Deal Name, Intex IDs, etc.)
+    _enrich_from_deals_catalog(result)
+
+    # Backfill all CSV columns with empty string if not set
+    for col in DEALS_COLUMNS + MANAGERS_COLUMNS + TRANSACTIONS_COLUMNS:
+        result.setdefault(col, '')
+
+
+def _enrich_from_manager_catalog(fields: dict) -> None:
+    """Fill manager metadata (Short Name, Ultimate Parent, etc.) from CSV catalog."""
+    mgr = fields.get('Collateral Manager')
+    if not mgr:
+        return
+    rows = _read_managers_csv()
+    if not rows:
+        return
+    mgr_lower = mgr.strip().lower()
+    for r in rows:
+        if (r.get('Name') or '').strip().lower() == mgr_lower:
+            for col in MANAGERS_COLUMNS:
+                if col == 'Name':
+                    continue  # don't overwrite
+                fields.setdefault(col, (r.get(col) or '').strip())
+            break
+
+
+def _enrich_from_deals_catalog(fields: dict) -> None:
+    """Fill deal metadata (Bloomberg Deal Name, Intex IDs) from CSV catalog."""
+    title = fields.get('Title')
+    if not title:
+        return
+    path = os.path.join(os.path.dirname(__file__), 'data', 'csv', 'clo-deals.csv')
+    try:
+        with open(path, 'r', encoding='utf-8-sig', newline='') as f:
+            reader = csv.DictReader(f)
+            title_lower = ' '.join(title.split()).lower()
+            for r in reader:
+                cand = ' '.join((r.get('Title') or '').split()).lower()
+                if cand == title_lower:
+                    for col in DEALS_COLUMNS:
+                        if col in ('Title', 'Collateral Type', 'Collateral Manager'):
+                            continue  # already set
+                        fields.setdefault(col, (r.get(col) or '').strip())
+                    break
+    except FileNotFoundError:
+        pass
