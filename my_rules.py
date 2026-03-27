@@ -174,24 +174,65 @@ def _agent_from_legal_text(text: str) -> Optional[str]:
 # Term extraction
 # ---------------------------------------------------------------------------
 
+def _normalize_term(rp: str, nc: str) -> str:
+    """Normalize term to standard format like 5nc2, 3nc1, 0nc6m."""
+    def _fmt(val: str) -> str:
+        val = val.strip()
+        # Already has month suffix
+        if val.lower().endswith('m'):
+            return val.lower()
+        try:
+            n = float(val)
+            # Express as integer if whole number
+            if n == int(n):
+                return str(int(n))
+            return val
+        except ValueError:
+            return val
+    return f"{_fmt(rp)}nc{_fmt(nc)}"
+
+
+def _months_between(date_str: str, ref_year: int = 2026, ref_month: int = 4) -> Optional[float]:
+    """Estimate months from an approximate closing date to a target date.
+    Returns years (rounded to 0.25) or None."""
+    from datetime import datetime
+    for fmt in ['%B %d, %Y', '%b %d, %Y', '%m/%d/%Y', '%Y-%m-%d']:
+        try:
+            dt = datetime.strptime(date_str.strip(), fmt)
+            # Approximate closing as ref_year April (common CLO closing month)
+            closing = datetime(ref_year, ref_month, 15)
+            diff_months = (dt.year - closing.year) * 12 + (dt.month - closing.month)
+            years = diff_months / 12.0
+            if years < 0:
+                return None
+            # Round to nearest 0.25
+            return round(years * 4) / 4
+        except ValueError:
+            continue
+    return None
+
+
 def _extract_term(text: str) -> Optional[str]:
-    """Extract term in RPncCP format from email text."""
+    """Extract term in RPncCP format from email text (e.g. 5nc2, 3nc1, 0nc6m)."""
     # Direct "5/2 transaction" or "5/2 reset"
     m = re.search(r'(?:^|\s)(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s+(?:transaction|deal|reset|refi)',
                   text, re.I)
     if m:
-        return f"{m.group(1)}nc{m.group(2)}"
+        return _normalize_term(m.group(1), m.group(2))
 
     # Already formatted: "3nc1", "5NC2"
     m = re.search(r'(\d+(?:\.\d+)?)\s*[Nn][Cc]\s*(\d+(?:\.\d+)?)', text)
     if m:
-        return f"{m.group(1)}nc{m.group(2)}"
+        return _normalize_term(m.group(1), m.group(2))
 
     # Extract from RP/NC period descriptions
     rp = None
     nc = None
+
+    # RP patterns — including bracket notation [3] and "N/A" for static deals
+    rp_is_zero = False
     for pat in [
-        r'(?i)reinvestment\s+(?:period)?[:\s]+(?:approx\.?\s*)?~?\s*(\d+(?:\.\d+)?)\s*(?:Y|year)',
+        r'(?i)reinvestment\s+(?:period)?[:\s]+(?:approx\.?\s*)?~?\s*\[?(\d+(?:\.\d+)?)\]?\s*(?:Y|year)',
         r'(?i)~(\d+(?:\.\d+)?)Y\.?\s*(?:RP|reinvestment)',
         r'(?i)(\d+(?:\.\d+)?)(?:y|Y)\.?\s+(?:RP|reinvestment)',
         r'(?i)(\d+(?:\.\d+)?)\s*(?:year|yr)s?\s+reinvestment',
@@ -201,19 +242,54 @@ def _extract_term(text: str) -> Optional[str]:
             rp = m.group(1)
             break
 
+    # Static deals: "Reinvestment Period: N/A" → RP = 0
+    if rp is None and re.search(r'(?i)reinvestment\s+(?:period)?[:\s]+N/?A', text):
+        rp = '0'
+        rp_is_zero = True
+
+    # RP from exact date: "End of Reinvestment Period: February 25, 2029"
+    if rp is None:
+        m = re.search(r'(?i)(?:end\s+of\s+)?reinvestment\s+(?:period)?[:\s]+(\w+\s+\d{1,2},?\s+\d{4})', text)
+        if m:
+            years = _months_between(m.group(1))
+            if years is not None:
+                rp = str(years)
+        # Also try MM/DD/YYYY: "Reinvestment Period (unch): 04/17/2029"
+        if rp is None:
+            m = re.search(r'(?i)reinvestment\s+(?:period\s*)?(?:\([^)]*\)\s*)?[:\s]+(\d{2}/\d{2}/\d{4})', text)
+            if m:
+                years = _months_between(m.group(1))
+                if years is not None:
+                    rp = str(years)
+
+    # NC patterns — including bracket notation [1]
     for pat in [
-        r'(?i)non-?call\s+(?:period)?[:\s]+(?:approx\.?\s*)?~?\s*(\d+(?:\.\d+)?)\s*(?:Y|year)',
-        r'(?i)~(\d+(?:\.\d+)?)Y\.?\s*(?:NC|non-?call)',
+        r'(?i)non-?call\s+(?:period)?[:\s]+(?:approx\.?\s*)?~?\s*\[?(\d+(?:\.\d+)?)\]?\s*(?:Y|year)',
+        r'(?i)~\[?(\d+(?:\.\d+)?)\]?Y\.?\s*(?:NC|non-?call)',
         r'(?i)(\d+(?:\.\d+)?)(?:y|Y)\.?\s+(?:NC|non-?call)',
         r'(?i)(\d+(?:\.\d+)?)\s*(?:year|yr)s?\s+non-?call',
+        # Month-based: "6M non-call" or "non-call period: 6 months"
+        r'(?i)non-?call\s+(?:period)?[:\s]+(?:approx\.?\s*)?~?\s*(\d+)\s*(?:M(?:onth)?)',
     ]:
         m = re.search(pat, text)
         if m:
-            nc = m.group(1)
+            # Check if this is months
+            if re.search(r'(?i)month', text[m.start():m.end()+10]):
+                nc = m.group(1) + 'm'
+            else:
+                nc = m.group(1)
             break
 
+    # NC from exact date: "Non-Call Period: 04/17/2027" or "End of Non-Call Period: ~[1] year"
+    if nc is None:
+        m = re.search(r'(?i)non-?call\s+(?:period\s*)?(?:\([^)]*\)\s*)?[:\s]+(\d{2}/\d{2}/\d{4})', text)
+        if m:
+            years = _months_between(m.group(1))
+            if years is not None:
+                nc = str(years)
+
     if rp and nc:
-        return f"{rp}nc{nc}"
+        return _normalize_term(rp, nc)
     return None
 
 
@@ -230,6 +306,15 @@ def _extract_deal_name(text: str, html: str) -> Optional[str]:
         text, re.I)
     if m:
         return _clean_html_value(m.group(1))
+
+    # 1b. GS format: "CLO Refi: Allegro CLO XVI, Ltd. -- Announcement"
+    m = re.search(
+        r'CLO\s+(?:Refi|Reset|New\s+Issue|Re-?Issue)[:\s]+\s*'
+        r'([A-Za-z0-9][A-Za-z0-9\s,.\-]+?(?:Ltd|LLC|LP|Corp|Inc)\.?)'
+        r'\s*(?:--|–|\u2013|\u2014|$)',
+        text, re.I)
+    if m:
+        return _clean_html_value(m.group(1)).rstrip(',').strip()
 
     # 2. BNP bold: "Refinancing of AIMCO CLO Series 2018-B"
     #    Match up to end-of-line, comma, HTML tag, or "managed by"
@@ -281,14 +366,19 @@ def _extract_manager(text: str, html: str) -> Optional[str]:
         # Citi/GS/SMBC structured: "MANAGER:    CARLYLE CLO MANAGEMENT LLC"
         # Require a colon after MANAGER to avoid matching boilerplate
         (r'MANAGER:\s+'
-         r'([A-Za-z0-9][A-Za-z0-9\s,.\-&]{3,80}?(?:LLC|LP|Ltd|Inc|Corp|Company|L\.L\.C\.|L\.P\.)\.?)', 0),
+         r'([A-Za-z0-9][A-Za-z0-9\s,.\-&]{3,80}?(?:LLC|LP|Ltd|Inc|Corp|Company|L\.L\.C\.|L\.P\.|Fund|BDC)\.?)', 0),
+        # GS/Barclays: "Collateral Manager:    AXA Investment Managers US Inc"
+        (r'Collateral\s+Manager:\s+'
+         r'([A-Za-z0-9][A-Za-z0-9\s,.\-&]{3,80}?(?:LLC|LP|Ltd|Inc|Corp|Company|L\.L\.C\.|L\.P\.|Fund|BDC)\.?)', re.I),
         # "managed by <Entity, LLC>" with entity suffix — stop at the suffix
         (r'(?:managed|sponsored)\s+by\s+'
-         r'([A-Za-z0-9][A-Za-z0-9\s,.\-&]{3,80}?(?:LLC|LP|Ltd|Inc|Corp|Company|L\.L\.C\.|L\.P\.)\.?)', re.I),
-        # "engaged by <Entity> (the "Manager")" — legal boilerplate
-        (r'engaged\s+by\s+([A-Za-z0-9][^(]{3,80}?)\s*\(the\s+["\u201c](?:Manager|Collateral\s+Manager)', re.I),
+         r'([A-Za-z0-9][A-Za-z0-9\s,.\-&]{3,80}?(?:LLC|LP|Ltd|Inc|Corp|Company|L\.L\.C\.|L\.P\.|Fund|BDC)\.?)', re.I),
+        # "engaged by <Entity> (the "Manager")" — legal boilerplate (handles smart quotes)
+        (r'engaged\s+by\s+([A-Za-z0-9][^(]{3,80}?)\s*\([\s""\u201c]*(?:the\s+)?["\u201c]?(?:Manager|Collateral\s+Manager)', re.I),
+        # "engaged by <Entity> ("Manager")" — variant with direct quote
+        (r'engaged\s+by\s+([A-Za-z0-9][^(]{3,80}?)\s*\(["\u201c]Manager', re.I),
         # "<Name> (the "Manager")" — entity name just before the parenthetical
-        (r'(?:by\s+)([A-Z0-9][A-Za-z0-9\s,.\-&]{3,80}?)\s*\(the\s+["\u201c](?:Manager|Collateral\s+Manager)', re.I),
+        (r'(?:by\s+)([A-Z0-9][A-Za-z0-9\s,.\-&]{3,80}?)\s*\(["\u201c](?:the\s+)?(?:Manager|Collateral\s+Manager)', re.I),
         # "managed by <Entity>." — fallback without entity suffix
         (r'(?:managed|sponsored)\s+by\s+([A-Za-z0-9][A-Za-z0-9\s,.\-&]{3,60}?)(?:\s*[.(])', re.I),
     ]
@@ -333,8 +423,8 @@ def _extract_collateral_type(text: str) -> str:
 # Transaction type extraction
 # ---------------------------------------------------------------------------
 
-def _extract_transaction_type(text: str) -> Optional[str]:
-    """Determine transaction type."""
+def _extract_transaction_type(text: str) -> str:
+    """Determine transaction type. Defaults to 'New Issue' when no other type detected."""
     # Order matters: check specific before generic
     if re.search(r'(?i)re-?issue', text):
         return "Re-Issue"
@@ -342,9 +432,8 @@ def _extract_transaction_type(text: str) -> Optional[str]:
         return "Refinancing"
     if re.search(r'(?i)\breset\b', text):
         return "Reset"
-    if re.search(r'(?i)new\s+issue', text):
-        return "New Issue"
-    return None
+    # Default: if no reset/refi/re-issue found, it's a new issue
+    return "New Issue"
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +446,7 @@ def _extract_status(text: str) -> str:
     if any(kw in lower for kw in ['has priced', 'pricing notification', 'final pricing',
                                    'final spread', 'transaction has priced']):
         return "Priced"
-    if any(kw in lower for kw in ['cancel', 'withdrawn', 'postponed']):
+    if re.search(r'(?:deal|transaction|offering)\s+(?:has\s+been\s+)?(?:cancelled|withdrawn|postponed)', lower):
         return "Cancelled"
     if any(kw in lower for kw in ['updated guidance', 'revised guidance', 'revised spread']):
         return "Announced"
