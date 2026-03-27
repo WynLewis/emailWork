@@ -148,10 +148,12 @@ class ExtractionResult(BaseModel):
 
     email_type: Optional[str] = None  # announced, updated, priced
     deal_name: Optional[str] = None
+    title: Optional[str] = None
     collateral_manager_legal_entity: Optional[str] = None
     collateral_manager_short: Optional[str] = None
     arranger: Optional[str] = None
     deal_type: Optional[str] = None
+    collateral_type: Optional[str] = None
     target_par_mm: Optional[float] = None
     reinvestment_period: Optional[str] = None
     non_call_period: Optional[str] = None
@@ -164,3 +166,5 @@ class ExtractionResult(BaseModel):
     updated_guidance: Optional[str] = None
     final_pricing: Optional[str] = None
     transaction_type: Optional[str] = None
+    term: Optional[str] = None
+    status: Optional[str] = None

@@ -542,10 +542,10 @@ def get_form_fields(mapping: dict = None) -> list[tuple]:
 # dict with the GUI-compatible namespaced keys populated.
 # ---------------------------------------------------------------------------
 
-# Maps common extraction field names → (store, store_field) so we can construct
-# the namespaced key "{store}__{store_field}".
-_EXTRACTION_TO_STORE = {
-    # Template keys → store mapping
+# Maps extraction template field names → (store, store_field).
+# These are aliases for common extraction names that differ from store_field names.
+# The store_field → (store, store_field) mappings are auto-derived from field_mapping.json.
+_TEMPLATE_ALIASES = {
     "deal_name":                        ("clo-deals", "Title"),
     "title":                            ("clo-deals", "Title"),
     "collateral_manager_legal_entity":  ("clo-deals", "Collateral Manager"),
@@ -559,27 +559,18 @@ _EXTRACTION_TO_STORE = {
     "final_pricing":                    ("clo-transactions", "Final Pricing Details"),
     "announced_date":                   ("clo-transactions", "Announcement Date"),
     "priced_date":                      ("clo-transactions", "Priced Date"),
-    # CSV column names (already in store_field format)
-    "Title":                            ("clo-deals", "Title"),
-    "Collateral Type":                  ("clo-deals", "Collateral Type"),
-    "Collateral Manager":               ("clo-deals", "Collateral Manager"),
-    "Bloomberg Deal Name":              ("clo-deals", "Bloomberg Deal Name"),
-    "Intex Deal":                       ("clo-deals", "Intex Deal"),
-    "Intex Preprice":                   ("clo-deals", "Intex Preprice"),
-    "Name":                             ("clo-managers", "Name"),
-    "Short Name":                       ("clo-managers", "Short Name"),
-    "Placement Agent":                  ("clo-transactions", "Placement Agent"),
-    "Transaction Type":                 ("clo-transactions", "Transaction Type"),
-    "Status":                           ("clo-transactions", "Status"),
-    "Term":                             ("clo-transactions", "Term"),
-    "IPT":                              ("clo-transactions", "IPT"),
-    "Final Pricing Details":            ("clo-transactions", "Final Pricing Details"),
-    "Announcement Date":                ("clo-transactions", "Announcement Date"),
-    "Priced Date":                      ("clo-transactions", "Priced Date"),
-    "Deal":                             ("clo-transactions", "Deal"),
-    "Engaged":                          ("clo-transactions", "Engaged"),
-    "Executed":                         ("clo-transactions", "Executed"),
 }
+
+
+def _build_extraction_to_store(mapping: dict) -> dict:
+    """Build full extraction→store mapping from aliases + field_mapping.json config."""
+    result = dict(_TEMPLATE_ALIASES)
+    for gui_key, cfg in mapping.get("fields", {}).items():
+        store = cfg.get("store")
+        store_field = cfg.get("store_field")
+        if store and store_field:
+            result[store_field] = (store, store_field)
+    return result
 
 
 def map_extraction_to_gui(extraction: dict, mapping: dict = None) -> dict:
@@ -598,8 +589,9 @@ def map_extraction_to_gui(extraction: dict, mapping: dict = None) -> dict:
 
     result = dict(extraction)  # preserve original keys
 
-    # Strategy 1: Use the static mapping table
-    for ext_key, (store, store_field) in _EXTRACTION_TO_STORE.items():
+    # Strategy 1: Use template aliases + auto-derived store_field mappings
+    ext_to_store = _build_extraction_to_store(mapping)
+    for ext_key, (store, store_field) in ext_to_store.items():
         val = extraction.get(ext_key)
         if val is not None and val != "":
             gui_key = f"{store}__{store_field}"
