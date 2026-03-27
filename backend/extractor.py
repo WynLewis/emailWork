@@ -693,15 +693,28 @@ _MOODY_TO_SP = {
 
 
 def _simplify_sp_rating(rating_cell: str) -> str:
-    """'Aaa/AAA' or 'Aa2/AA' → simplified S&P equivalent e.g. 'AA'."""
-    parts = [p.strip() for p in rating_cell.strip().split("/")]
-    for p in reversed(parts):  # prefer S&P (usually second)
+    """'Aaa/AAA' or 'Aa2/AA' or '[AAA](sf)/-' → simplified S&P equivalent e.g. 'AAA'."""
+    # Strip HTML entities, brackets, (sf), sf suffix, and whitespace
+    cleaned = rating_cell.strip()
+    cleaned = re.sub(r'&nbsp;', ' ', cleaned)
+    cleaned = re.sub(r'&\w+;', ' ', cleaned)
+    cleaned = re.sub(r'[\[\]]', '', cleaned)
+    cleaned = re.sub(r'\(sf\)', '', cleaned, flags=re.I)
+    cleaned = re.sub(r'sf\b', '', cleaned, flags=re.I)
+    cleaned = cleaned.strip()
+    parts = [p.strip() for p in cleaned.split("/")]
+    # Remove empty, dash-only, and NR parts for initial pass
+    non_nr_parts = [p for p in parts if p and p != '-' and p.upper() != 'NR']
+    # First try non-NR parts (prefer actual ratings over NR)
+    for p in reversed(non_nr_parts):  # prefer S&P (usually second/third)
         if p in _SP_SIMPLIFY:
             return _SP_SIMPLIFY[p]
-    for p in parts:
+    for p in non_nr_parts:
         if p in _MOODY_TO_SP:
             return _MOODY_TO_SP[p]
-    return parts[-1] if parts else "NR"
+    # If all parts are NR or empty, return NR
+    all_parts = [p for p in parts if p and p != '-']
+    return all_parts[-1] if all_parts else "NR"
 
 
 def _short_tranche(name: str) -> str:
@@ -714,20 +727,48 @@ def _format_spread(cell_text: str):
     """
     Parse a spread cell and return (formatted_text, skip).
     skip=True for residual/sub/equity rows.
+
+    Handles formats from all banks:
+    - BNP: "117-119", "150-155"
+    - Citi: "124-125", "145a", "Call Desk (127)"
+    - SMBC: "S + 145a", "SUBJECT (115)", "RETAINED"
+    - GS: "SOFR + 123-124"
+    - Barclays: "122a", "155-165", "NOT BEING REFINANCED"
+    - BNP: "122 / Call Desk", "100-105 / New Tranche"
     """
     t = cell_text.strip()
+    # Strip bracket notation: "[115]" → "115"
+    t = re.sub(r'\[(\d+(?:\.\d+)?)\]', r'\1', t)
     low = t.lower()
 
     if any(kw in low for kw in ('residual', 'equity')):
         return None, True
 
+    if 'retained' in low:
+        return 'retained', False
     if 'preplaced' in low or 'pre-placed' in low:
         return 'preplaced', False
+    if 'not being refinanced' in low:
+        return None, True
+
+    # "SUBJECT (115)" → "@ 115 dm" (subject with indicative level)
+    m = re.search(r'subject\s*\((\d+(?:\.\d+)?)\)', low)
+    if m:
+        return f"@ {m.group(1)} dm", False
     if 'subject' in low:
         return 'subject', False
 
-    # Floating with prefix: "SOFR + 130 area", "SOFR + 125-127", "L + 126"
-    m = re.search(r'[+]\s*(\d+(?:\.\d+)?)\s*(?:-\s*(\d+(?:\.\d+)?))?\s*(area|a\b)?', low)
+    # "Call Desk (127)" → "@ 127 dm"
+    m = re.search(r'call\s*desk\s*\((\d+(?:\.\d+)?)\)', low)
+    if m:
+        return f"@ {m.group(1)} dm", False
+
+    # Strip "/ Call Desk", "/ New Tranche" suffixes before parsing
+    cleaned = re.sub(r'\s*/\s*(?:call\s*desk|new\s*tranche|roller)\s*$', '', t, flags=re.I).strip()
+    cleaned_low = cleaned.lower()
+
+    # Floating with prefix: "SOFR + 130 area", "S + 145a", "SOFR + 125-127", "L + 126"
+    m = re.search(r'[+]\s*(\d+(?:\.\d+)?)\s*(?:-\s*(\d+(?:\.\d+)?))?\s*(area|a\b)?', cleaned_low)
     if m:
         s1 = m.group(1)
         s2 = m.group(2)
@@ -736,8 +777,8 @@ def _format_spread(cell_text: str):
             return f"@ {s1}-{s2} dm", False
         return f"@ {s1}{area} dm", False
 
-    # Plain numeric: "130 area", "120-130", "126"
-    m = re.search(r'^(\d+(?:\.\d+)?)\s*(?:-\s*(\d+(?:\.\d+)?))?\s*(area|a\b)?$', low.strip())
+    # Plain numeric: "130 area", "120-130", "126", "145a"
+    m = re.search(r'^(\d+(?:\.\d+)?)\s*(?:-\s*(\d+(?:\.\d+)?))?\s*(area|a\b)?$', cleaned_low.strip())
     if m:
         s1 = m.group(1)
         s2 = m.group(2)
@@ -754,6 +795,118 @@ def _format_spread(cell_text: str):
         return f"@ {eq} dm (fixed {m.group(1)}%)", False
 
     return f"@ {t}", False
+
+
+def _parse_text_tranche_table(email_html: str) -> list:
+    """
+    Parse tranche tables from plain-text-formatted emails (Barclays, GS).
+
+    These emails embed data as individual <td> cells in vertical layout (Barclays)
+    or as space-aligned text lines (GS), not in standard HTML <table> rows.
+
+    Returns list of (short_name, rating, formatted_spread, numeric_spread) tuples.
+    """
+    # Strip HTML to get clean text lines
+    text = re.sub(r'<[^>]+>', '\n', email_html)
+    text = re.sub(r'&nbsp;', ' ', text)
+    text = re.sub(r'&amp;', '&', text)
+    text = re.sub(r'&lt;', '<', text)
+    text = re.sub(r'&gt;', '>', text)
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+
+    tranches = []
+
+    # Pattern 1: GS space-aligned format
+    # "A-1         $[288.00]    [35.6]%    [AAA](sf)/-    SOFR + 123-124    100.00    [4.5]"
+    # "B-1 (Sr)     $[31.50]    [26.1]%    -/[AAsf]       SOFR + 150-155    100.00    [6.5]"
+    for line in lines:
+        m = re.match(
+            r'^([A-Z][\w\-]*(?:\s*\([A-Z][a-z]\))?)\s+'     # tranche name
+            r'\$?\[?[\d,.]+\]?\s+'                            # size
+            r'\[?[\d.]+\]?%\s+'                               # C/E or sub
+            r'([\[\]A-Za-z()\-/\s]+?)\s{2,}'                 # rating (2+ spaces end it)
+            r'((?:SOFR|S|L)\s*\+\s*[\d\-.]+(?:\s*(?:area|a))?'  # SOFR + spread
+            r'|[\d]+(?:\s*-\s*[\d]+)?(?:\s*a)?)',             # or plain numeric spread
+            line, re.I
+        )
+        if m:
+            name = _short_tranche(m.group(1))
+            rating = _simplify_sp_rating(m.group(2))
+            fmt, skip = _format_spread(m.group(3))
+            if skip:
+                continue
+            numeric = None
+            nm = re.search(r'@\s*(\d+(?:\.\d+)?)', fmt) if fmt else None
+            if nm:
+                numeric = float(nm.group(1))
+            tranches.append((name, rating, fmt, numeric))
+
+    if tranches:
+        return tranches
+
+    # Pattern 2: Barclays vertical format — columns repeat in sequence:
+    # Class, Rating, Size, Sub%, MVOC, WAL, Type, Guidance (8 fields per tranche)
+    # Detect by finding the header sequence
+    header_idx = None
+    num_cols = 0
+    # Known header labels for Barclays-style vertical tables
+    _header_labels = {'class', 's&p', 'moody', 'fitch', 'rating', 'class size', 'size',
+                      'par sub', 'subordination', 'mvoc', 'wal', 'type', 'flt/fix',
+                      'guidance', 'guidance/status', 'px talk', 'ipt', 'spread',
+                      'notional', 'par', 'c/e'}
+    for i, line in enumerate(lines):
+        if line.lower().rstrip('^') in ('class',):
+            # Count header lines: keep going while lines look like headers
+            for j in range(i + 1, min(i + 12, len(lines))):
+                if lines[j].startswith('---'):
+                    header_idx = i
+                    num_cols = j - i
+                    break
+                # If this line is NOT a known header label, data starts here
+                if lines[j].lower().rstrip('^') not in _header_labels:
+                    header_idx = i
+                    num_cols = j - i
+                    break
+            break
+
+    if header_idx is not None and num_cols >= 4:
+        # Find which columns are rating and guidance
+        header_lines = [lines[header_idx + k].lower() for k in range(num_cols)]
+        rating_col = None
+        guidance_col = None
+        for k, h in enumerate(header_lines):
+            if any(kw in h for kw in ('s&p', 'moody', 'fitch', 'rating')):
+                rating_col = k
+            if any(kw in h for kw in ('guidance', 'px talk', 'talk', 'ipt')):
+                guidance_col = k
+
+        if rating_col is not None and guidance_col is not None:
+            # Data starts after the headers (and optional dashed line)
+            data_start = header_idx + num_cols
+            while data_start < len(lines) and lines[data_start].startswith('---'):
+                data_start += 1
+
+            # Read tranches: each tranche is num_cols consecutive lines
+            while data_start + num_cols <= len(lines):
+                chunk = lines[data_start:data_start + num_cols]
+                # Stop at dashed separator, notes, or non-tranche data
+                if chunk[0].startswith('---') or chunk[0].lower().startswith('note'):
+                    break
+
+                name = _short_tranche(chunk[0])
+                rating = _simplify_sp_rating(chunk[rating_col]) if rating_col < len(chunk) else "NR"
+                spread_text = chunk[guidance_col] if guidance_col < len(chunk) else ""
+                fmt, skip = _format_spread(spread_text)
+                if not skip:
+                    numeric = None
+                    nm = re.search(r'@\s*(\d+(?:\.\d+)?)', fmt) if fmt else None
+                    if nm:
+                        numeric = float(nm.group(1))
+                    tranches.append((name, rating, fmt, numeric))
+
+                data_start += num_cols
+
+    return tranches
 
 
 def format_tranche_pricing(email_html: str) -> dict:
@@ -784,34 +937,51 @@ def format_tranche_pricing(email_html: str) -> dict:
         if len(rows) < 2:
             continue
 
-        # Parse header row
+        # Parse header row — strip HTML tags and decode entities
         hcells = re.findall(r'<t[hd][^>]*>(.*?)</t[hd]>', rows[0], re.DOTALL | re.IGNORECASE)
         headers = [re.sub(r'<[^>]+>', '', c).strip() for c in hcells]
+        # Strip footnote markers (^, ^^, ^^^) and decode &amp;
+        headers = [re.sub(r'\^+$', '', h).strip() for h in headers]
+        headers = [h.replace('&amp;', '&') for h in headers]
         hlower = [h.lower() for h in headers]
 
         # Identify tranche and rating columns
         tranche_idx = rating_idx = None
         for i, h in enumerate(hlower):
-            if 'tranche' in h or 'class' in h:
+            if tranche_idx is None and ('tranche' in h or 'class' in h):
                 tranche_idx = i
-            if 'rating' in h:
+            # Rating: "S&P", "Moody", "Fitch", "Rating", "S&P / M / F", "Moody's/Fitch"
+            if rating_idx is None and any(kw in h for kw in ('rating', 's&p', 'moody', 'fitch', 'mdys')):
                 rating_idx = i
         if tranche_idx is None:
             continue
 
+        # Columns to skip (not spread data)
+        # Note: "status" alone is skipped, but "guidance/status" is kept (handled below)
+        _skip_keywords = ('size', '$', 'amount', 'notional', 'par sub', 'subordination',
+                          'wal', 'mvoc', 'flt', 'fix', 'type', 'price',
+                          'c/e', 'credit enhancement')
+
         # Map spread columns → pricing type
         spread_map = {}
         for i, h in enumerate(hlower):
-            if i == tranche_idx or i == rating_idx or 'size' in h or '$' in h or 'amount' in h:
+            if i == tranche_idx or i == rating_idx:
+                continue
+            if any(kw in h for kw in _skip_keywords):
                 continue
             if 'final' in h:
                 spread_map[i] = 'final_pricing'
-            elif any(kw in h for kw in ('revised', 'updated', 'guidance')):
+            elif any(kw in h for kw in ('revised', 'updated')):
                 spread_map[i] = 'updated_guidance'
             elif 'ipt' in h:
                 spread_map[i] = 'ipt'
+            # "Guidance", "Guidance/Status", "PX TALK"
+            elif any(kw in h for kw in ('guidance', 'px talk', 'talk')):
+                spread_map[i] = '_generic'
             elif 'spread' in h or 'coupon' in h:
                 spread_map[i] = '_generic'
+            # Skip standalone "Status" column (not "Guidance/Status")
+            # — already handled above via 'guidance' match
 
         # Resolve generic columns using the section heading before this table
         if '_generic' in spread_map.values():
@@ -906,6 +1076,47 @@ def format_tranche_pricing(email_html: str) -> dict:
                         lines.append(f"{blended_name} ({rating}) {fmt}")
 
             results[pkey] = "\n".join(lines)
+
+    # Fallback: parse plain-text tables (Barclays, GS) if no HTML tables found
+    if not any(results.values()):
+        text_tranches = _parse_text_tranche_table(email_html)
+        if text_tranches:
+            # Build output using same Sr AAA / Jr AAA logic
+            lines = []
+            aaa = [(s, r, f, n) for s, r, f, n in text_tranches if r == "AAA"]
+            others = [(s, r, f, n) for s, r, f, n in text_tranches if r != "AAA"]
+
+            if len(aaa) > 1:
+                for i, (short, _, fmt, _) in enumerate(aaa):
+                    label = "Sr AAA" if i == 0 else "Jr AAA"
+                    lines.append(f"{short} ({label}) {fmt}")
+            elif aaa:
+                short, _, fmt, _ = aaa[0]
+                lines.append(f"{short} (AAA) {fmt}")
+
+            groups = {}
+            for short, rating, fmt, numeric in others:
+                groups.setdefault(rating, []).append((short, fmt, numeric))
+
+            for rating, items in groups.items():
+                if len(items) == 1:
+                    short, fmt, _ = items[0]
+                    lines.append(f"{short} ({rating}) {fmt}")
+                else:
+                    names = [s for s, _, _ in items]
+                    numerics = [n for _, _, n in items if n is not None]
+                    blended_name = "/".join(names)
+                    if numerics:
+                        avg = round(sum(numerics) / len(numerics))
+                        has_area = any('a ' in (f or '') for _, f, _ in items)
+                        suffix = "a" if has_area else ""
+                        lines.append(f"{blended_name} ({rating}) @ {avg}{suffix} dm")
+                    else:
+                        _, fmt, _ = items[0]
+                        lines.append(f"{blended_name} ({rating}) {fmt}")
+
+            if lines:
+                results["ipt"] = "\n".join(lines)
 
     return results
 
