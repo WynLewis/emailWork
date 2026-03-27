@@ -71,7 +71,7 @@ from abc import ABC, abstractmethod
 
 from backend import config
 from backend.models import ExtractionResult
-from backend.field_mapping import load_mapping, get_skipped_fields, get_active_fields
+from backend.field_mapping import load_mapping, get_skipped_fields, get_active_fields, map_extraction_to_gui
 
 logger = logging.getLogger(__name__)
 
@@ -1404,7 +1404,13 @@ class RuleBasedExtractor(BaseExtractor):
             except Exception as e:
                 logger.warning(f"Custom rules module error: {e}")
 
-        return ExtractionResult(**{k: v for k, v in fields.items() if k in ExtractionResult.model_fields})
+        # Map extraction fields to GUI-compatible namespaced keys
+        # (e.g. "deal_name" → "clo-deals__Title")
+        fields = map_extraction_to_gui(fields)
+
+        # Build ExtractionResult — include both model fields and extra GUI keys
+        # ExtractionResult has extra="allow" so namespaced keys pass through
+        return ExtractionResult(**fields)
 
 
 def _load_rules_module(module_path: str):

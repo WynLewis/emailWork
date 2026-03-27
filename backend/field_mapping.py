@@ -529,3 +529,111 @@ def get_form_fields(mapping: dict = None) -> list[tuple]:
         if cfg.get("extract", True):
             result.append((name, cfg.get("label", name), cfg.get("form_type", "text")))
     return result
+
+
+# ---------------------------------------------------------------------------
+# EXTRACTION → GUI FIELD MAPPING
+# ---------------------------------------------------------------------------
+# The extraction produces template keys like "deal_name", "arranger", "Title",
+# "Placement Agent" etc. The GUI form uses namespaced keys from field_mapping.json
+# like "clo-deals__Title", "clo-transactions__Placement Agent".
+#
+# This function bridges the two: given an extraction dict, it produces a new
+# dict with the GUI-compatible namespaced keys populated.
+# ---------------------------------------------------------------------------
+
+# Maps common extraction field names → (store, store_field) so we can construct
+# the namespaced key "{store}__{store_field}".
+_EXTRACTION_TO_STORE = {
+    # Template keys → store mapping
+    "deal_name":                        ("clo-deals", "Title"),
+    "title":                            ("clo-deals", "Title"),
+    "collateral_manager_legal_entity":  ("clo-deals", "Collateral Manager"),
+    "collateral_type":                  ("clo-deals", "Collateral Type"),
+    "deal_type":                        ("clo-deals", "Collateral Type"),
+    "collateral_manager_short":         ("clo-managers", "Short Name"),
+    "arranger":                         ("clo-transactions", "Placement Agent"),
+    "transaction_type":                 ("clo-transactions", "Transaction Type"),
+    "term":                             ("clo-transactions", "Term"),
+    "ipt":                              ("clo-transactions", "IPT"),
+    "final_pricing":                    ("clo-transactions", "Final Pricing Details"),
+    "announced_date":                   ("clo-transactions", "Announcement Date"),
+    "priced_date":                      ("clo-transactions", "Priced Date"),
+    # CSV column names (already in store_field format)
+    "Title":                            ("clo-deals", "Title"),
+    "Collateral Type":                  ("clo-deals", "Collateral Type"),
+    "Collateral Manager":               ("clo-deals", "Collateral Manager"),
+    "Bloomberg Deal Name":              ("clo-deals", "Bloomberg Deal Name"),
+    "Intex Deal":                       ("clo-deals", "Intex Deal"),
+    "Intex Preprice":                   ("clo-deals", "Intex Preprice"),
+    "Name":                             ("clo-managers", "Name"),
+    "Short Name":                       ("clo-managers", "Short Name"),
+    "Placement Agent":                  ("clo-transactions", "Placement Agent"),
+    "Transaction Type":                 ("clo-transactions", "Transaction Type"),
+    "Status":                           ("clo-transactions", "Status"),
+    "Term":                             ("clo-transactions", "Term"),
+    "IPT":                              ("clo-transactions", "IPT"),
+    "Final Pricing Details":            ("clo-transactions", "Final Pricing Details"),
+    "Announcement Date":                ("clo-transactions", "Announcement Date"),
+    "Priced Date":                      ("clo-transactions", "Priced Date"),
+    "Deal":                             ("clo-transactions", "Deal"),
+    "Engaged":                          ("clo-transactions", "Engaged"),
+    "Executed":                         ("clo-transactions", "Executed"),
+}
+
+
+def map_extraction_to_gui(extraction: dict, mapping: dict = None) -> dict:
+    """
+    Map extraction field names to GUI-compatible namespaced keys.
+
+    Takes a flat extraction dict (e.g. {"deal_name": "...", "arranger": "..."})
+    and returns a new dict with BOTH the original keys AND the namespaced keys
+    (e.g. {"deal_name": "...", "clo-deals__Title": "...", "clo-transactions__Placement Agent": "..."}).
+
+    This ensures the GUI form fields (which use namespaced keys from field_mapping.json)
+    get populated from rule-based extraction results.
+    """
+    if mapping is None:
+        mapping = load_mapping()
+
+    result = dict(extraction)  # preserve original keys
+
+    # Strategy 1: Use the static mapping table
+    for ext_key, (store, store_field) in _EXTRACTION_TO_STORE.items():
+        val = extraction.get(ext_key)
+        if val is not None and val != "":
+            gui_key = f"{store}__{store_field}"
+            result.setdefault(gui_key, val)
+
+    # Strategy 2: For any field in the mapping config, try to find the value
+    # by matching on store_field name (handles fields not in the static table)
+    for gui_key, cfg in mapping.get("fields", {}).items():
+        if gui_key in result and result[gui_key]:
+            continue  # already set
+        store_field = cfg.get("store_field")
+        if store_field and store_field in extraction:
+            val = extraction[store_field]
+            if val is not None and val != "":
+                result[gui_key] = val
+
+    # Also map email_type → Status for the transactions store
+    email_type = extraction.get("email_type", "")
+    if email_type:
+        status_map = {"announced": "Announced", "updated": "Announced", "priced": "Priced"}
+        status = status_map.get(email_type, email_type.capitalize())
+        result.setdefault("clo-transactions__Status", status)
+
+    # Map deal_name → clo-transactions__Deal and clo-transactions__Title
+    deal_name = extraction.get("deal_name") or extraction.get("title") or extraction.get("Title")
+    if deal_name:
+        result.setdefault("clo-transactions__Deal", deal_name)
+        result.setdefault("clo-transactions__Title", deal_name)
+        result.setdefault("clo-transactions__Collateral Type",
+                          extraction.get("collateral_type") or extraction.get("deal_type") or "")
+
+    # Map manager to both deals and managers store
+    mgr = extraction.get("collateral_manager_legal_entity") or extraction.get("Collateral Manager")
+    if mgr:
+        result.setdefault("clo-managers__Name", mgr)
+
+    return result

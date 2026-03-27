@@ -59,6 +59,7 @@ from pydantic import BaseModel
 
 from backend import config
 from backend.extractor import get_extractor, detect_email_type, format_tranche_pricing, parse_deal_fields
+from backend.field_mapping import map_extraction_to_gui
 from backend.models import ExtractionResult, new_id, now_iso
 from backend.watcher import EmailQueue
 from backend import store
@@ -166,6 +167,10 @@ def get_next():
         for key in ("ipt", "updated_guidance", "final_pricing"):
             if pricing.get(key):
                 extraction[key] = pricing[key]
+
+    # Map extraction fields to GUI-compatible namespaced keys
+    if extraction:
+        extraction = map_extraction_to_gui(extraction)
 
     # For "updated" or "priced" emails, look up existing records so the
     # user can see what was previously saved and compare
