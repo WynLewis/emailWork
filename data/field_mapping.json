@@ -68,7 +68,7 @@
     "clo-managers__Name": {
       "label": "Name",
       "store": "clo-managers",
-      "store_field": "Full Legal Name",
+      "store_field": "Name",
       "extract": true,
       "form_type": "text",
       "notes": "Used to Match to deals and then to take ShortName to transactions"

@@ -34,11 +34,12 @@ logger = logging.getLogger(__name__)
 MAPPING_FILE = os.path.join(config.DATA_DIR, "field_mapping.json")
 
 # ---------------------------------------------------------------------------
-# STORE NAMES — Must match the store constants in store.py
+# STORE NAMES — Must match the "store" values in data/field_mapping.json
+# AND the store.py file constants (clo-deals.json, clo-managers.json, etc.)
 # ---------------------------------------------------------------------------
-STORE_DEALS = "deals"
-STORE_TRANSACTIONS = "transactions"
-STORE_MANAGERS = "managers"
+STORE_DEALS = "clo-deals"
+STORE_TRANSACTIONS = "clo-transactions"
+STORE_MANAGERS = "clo-managers"
 STORE_DEAL_ORDERS = "deal_orders"
 STORE_NONE = None  # Field is used for routing/display only (e.g. email_type)
 

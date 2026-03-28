@@ -62,32 +62,34 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # BLOOMBERG LEAD MANAGER CODE → Full Name Lookup
 # ---------------------------------------------------------------------------
+# Values normalized to match clo-transactions.json Placement Agent values
+# and the email extractor's bank name output.
 LEAD_MGR_MAP = {
     "BNPP":  "BNP Paribas",
-    "JPM":   "J.P. Morgan",
+    "JPM":   "JPMorgan",
     "MS":    "Morgan Stanley",
     "BOFA":  "Bank of America",
-    "BAML":  "Bank of America Merrill Lynch",
+    "BAML":  "Bank of America",
     "BofA":  "Bank of America",
     "CITG":  "Citigroup",
-    "SMBC":  "SMBC Nikko",
+    "SMBC":  "SMBC",
     "JEF":   "Jefferies",
     "WFS":   "Wells Fargo",
     "CIBC":  "CIBC",
-    "CIBM":  "CIBC Capital Markets",
+    "CIBM":  "CIBC",
     "SCOB":  "Scotia",
-    "RBC":   "RBC Capital Markets",
+    "RBC":   "RBC",
     "GLCM":  "Goldman Sachs",
     "GS":    "Goldman Sachs",
     "MIZU":  "Mizuho",
     "NS":    "Nomura",
-    "MUSA":  "Morgan Stanley",  # alternate code
+    "MUSA":  "Morgan Stanley",
     "MSUL":  "Morgan Stanley",
     "SANT":  "Santander",
-    "MU":    "Mitsubishi UFJ",
+    "MU":    "Mitsubishi",
     "NATX":  "Natixis",
     "DBS":   "DBS Bank",
-    "BCM":   "BMO Capital Markets",
+    "BCM":   "BMO",
     "BCMK":  "Benchmark (self-arranged)",
     "ELDR":  "Eldridge",
     "Jnt":   "Joint Lead",
@@ -568,7 +570,13 @@ def build_tranche_detail(rated_tranches: list[dict]) -> list[dict]:
 
 def update_stores_from_pricing(deal_info: dict, all_tranches: list[dict]) -> dict:
     """
-    Update deals.json, transactions.json, and managers.json from pricing data.
+    Update clo-deals.json, clo-transactions.json, clo-managers.json from pricing data.
+
+    Uses the same SharePoint field names as the email extractor GUI:
+    - clo-deals.json:        Title, Collateral Type, Collateral Manager, Bloomberg Deal Name
+    - clo-transactions.json: Deal, Title, Status, Priced Date, Final Pricing Details,
+                             Placement Agent, Transaction Type, Term, Collateral Type
+    - clo-managers.json:     Name, Short Name
 
     Parameters:
         deal_info    — from parse_pricing_csv()
@@ -615,97 +623,111 @@ def update_stores_from_pricing(deal_info: dict, all_tranches: list[dict]) -> dic
                 break
 
     deal_type = COLLATERAL_MAP.get(collat_type, deal_info.get("deal_type", ""))
+    manager_short = _extract_manager_short(manager_name)
+    placement_agent = deal_info.get("lead_mgr_full", "")
 
-    # Calculate total par from rated debt tranches
-    total_par = None
-    if rated:
-        total = sum(t["orig_amt"] for t in rated if t["orig_amt"])
-        if total > 0:
-            total_par = round(total / 1_000_000, 1)
+    # Derive term from call_date (NC) and reinvest_end (RP) if available
+    term = ""
+    if call_date and reinvest_end and settle_date:
+        try:
+            from datetime import datetime as _dt
+            settle = _dt.strptime(settle_date, "%m/%d/%Y")
+            rp_end = _dt.strptime(reinvest_end, "%Y-%m-%d")
+            nc_end = _dt.strptime(call_date, "%Y-%m-%d")
+            rp_years = round((rp_end - settle).days / 365.25 * 4) / 4
+            nc_years = round((nc_end - settle).days / 365.25 * 4) / 4
+            rp_str = str(int(rp_years)) if rp_years == int(rp_years) else str(rp_years)
+            nc_str = str(int(nc_years)) if nc_years == int(nc_years) else str(nc_years)
+            term = f"{rp_str}nc{nc_str}"
+        except (ValueError, TypeError):
+            pass
 
-    # ── Update/Create Deal ──
+    # ── Update/Create Deal (clo-deals.json) ──
+    # Match on Title (the deal name field in clo-deals.json)
     existing_deal = store.find_record(
         store.DEALS,
-        lambda r: r.get("deal_name") == deal_name
+        lambda r: r.get("Title", "").strip() == deal_name.strip()
     )
     if existing_deal:
-        updates = {"updated_at": now}
+        updates = {}
         if deal_type:
-            updates["deal_type"] = deal_type
-        if total_par:
-            updates["target_par"] = total_par
-        if deal_info.get("lead_mgr_full"):
-            updates["arranger"] = deal_info["lead_mgr_full"]
-        if call_date:
-            updates["non_call_period"] = call_date
-        if reinvest_end:
-            updates["reinvestment_period"] = reinvest_end
-        store.update_record(store.DEALS, lambda r: r.get("deal_name") == deal_name, updates)
+            updates["Collateral Type"] = deal_type
+        if manager_name:
+            updates["Collateral Manager"] = manager_name
+        if updates:
+            store.update_record(
+                store.DEALS,
+                lambda r: r.get("Title", "").strip() == deal_name.strip(),
+                updates,
+            )
         summary["deal"] = "updated"
     else:
         deal_data = {
-            "id": new_id(),
-            "deal_name": deal_name,
-            "deal_type": deal_type,
-            "target_par": total_par,
-            "arranger": deal_info.get("lead_mgr_full", ""),
-            "collateral_manager_short": _extract_manager_short(manager_name),
-            "legal_entity": manager_name,
-            "non_call_period": call_date or "",
-            "reinvestment_period": reinvest_end or "",
-            "created_at": now,
-            "updated_at": now,
+            "Title": deal_name,
+            "Collateral Type": deal_type,
+            "Collateral Manager": manager_name,
+            "Bloomberg Deal Name": deal_name,  # BBG deal name = CSV deal name
+            "Intex Deal": "",
+            "Intex Preprice": "",
+            "Deal Documents": "",
         }
         store.append_record(store.DEALS, deal_data)
         summary["deal"] = "created"
 
-    # ── Update/Create Transaction ──
+    # ── Update/Create Transaction (clo-transactions.json) ──
+    # Match on Deal field (links to deal Title) where Status != Priced
     existing_txn = store.find_record(
         store.TRANSACTIONS,
-        lambda r: r.get("deal_name") == deal_name and r.get("status") != "Priced"
+        lambda r: r.get("Deal", "").strip() == deal_name.strip() and r.get("Status") != "Priced"
     )
     txn_updates = {
-        "status": "Priced",
-        "priced_date": pricing_date,
-        "final_pricing": final_pricing,
-        "tranche_detail": tranche_detail,
-        "transaction_type": transaction_type,
-        "settle_date": settle_date,
-        "updated_at": now,
+        "Status": "Priced",
+        "Priced Date": pricing_date,
+        "Final Pricing Details": final_pricing,
+        "Transaction Type": transaction_type,
+        "Placement Agent": placement_agent,
+        "Collateral Type": deal_type,
     }
+    if term:
+        txn_updates["Term"] = term
+
     if existing_txn:
         store.update_record(
             store.TRANSACTIONS,
-            lambda r: r.get("deal_name") == deal_name and r.get("status") != "Priced",
+            lambda r: r.get("Deal", "").strip() == deal_name.strip() and r.get("Status") != "Priced",
             txn_updates,
         )
         summary["transaction"] = "updated to Priced"
     else:
         txn_data = {
-            "id": new_id(),
-            "deal_name": deal_name,
-            "collateral_manager": _extract_manager_short(manager_name),
-            "created_at": now,
+            "Engaged": "False",
+            "Executed": "False",
+            "Deal": deal_name,
+            "Title": deal_name,
+            "IPT": "",
+            "Collateral Manager": manager_name,
+            "Announcement Date": "",
         }
         txn_data.update(txn_updates)
         store.append_record(store.TRANSACTIONS, txn_data)
         summary["transaction"] = "created as Priced"
 
-    # ── Update/Create Manager ──
-    if manager_name:
-        short = _extract_manager_short(manager_name)
+    # ── Update/Create Manager (clo-managers.json) ──
+    if manager_name and manager_short:
         existing_mgr = store.find_record(
             store.MANAGERS,
-            lambda r: r.get("short_name") == short
+            lambda r: r.get("Short Name", "").strip().lower() == manager_short.strip().lower()
         )
         if not existing_mgr:
             store.append_record(store.MANAGERS, {
-                "id": new_id(),
-                "short_name": short,
-                "legal_entity": manager_name,
-                "created_at": now,
+                "Name": manager_name,
+                "Short Name": manager_short,
+                "Ultimate Parent": "",
+                "CRD Number": "",
+                "SEC Number": "",
+                "Website": "",
             })
-            summary["manager"] = f"created ({short})"
+            summary["manager"] = f"created ({manager_short})"
 
     return summary
 
@@ -733,9 +755,9 @@ def is_already_priced(deal_name: str, pricing_date: str) -> bool:
     existing = store.find_record(
         store.TRANSACTIONS,
         lambda r: (
-            r.get("deal_name") == deal_name
-            and r.get("status") == "Priced"
-            and r.get("priced_date") == pricing_date
+            r.get("Deal", "").strip() == deal_name.strip()
+            and r.get("Status") == "Priced"
+            and r.get("Priced Date") == pricing_date
         ),
     )
     return existing is not None

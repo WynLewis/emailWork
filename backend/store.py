@@ -131,9 +131,12 @@ def clear_store(name: str) -> None:
 # ---------------------------------------------------------------------------
 # STORE NAME CONSTANTS — Use these instead of raw strings for safety.
 # ---------------------------------------------------------------------------
-DEALS = "deals.json"
-MANAGERS = "managers.json"
-TRANSACTIONS = "transactions.json"
+# These must match the "store" values in data/field_mapping.json:
+#   "clo-deals", "clo-managers", "clo-transactions"
+# The .json extension is appended by _path().
+DEALS = "clo-deals.json"
+MANAGERS = "clo-managers.json"
+TRANSACTIONS = "clo-transactions.json"
 DEAL_ORDERS = "deal_orders.json"
 
 ALL_STORES = [DEALS, MANAGERS, TRANSACTIONS, DEAL_ORDERS]
