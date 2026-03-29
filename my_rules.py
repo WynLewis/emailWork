@@ -482,10 +482,14 @@ def extract_from_email(email_text: str) -> dict:
     """
     Extract CLO deal fields from email text using custom rules.
 
-    Returns dict with field names as keys. Only includes fields
-    that were successfully extracted.
+    Returns dict with field names as keys. Also includes a '_confidence'
+    dict mapping field names to confidence levels:
+        'high'   — strong regex match on structured text (DEAL NAME:, MANAGER:, etc.)
+        'medium' — matched from legal boilerplate or derived from other fields
+        'low'    — fallback/default value or inferred from sender domain
     """
     result: Dict[str, Any] = {}
+    confidence: Dict[str, str] = {}
 
     visible = _to_text(email_text)
     combined = f"{visible}\n{email_text}"
@@ -495,6 +499,15 @@ def extract_from_email(email_text: str) -> dict:
     if deal_name:
         result['deal_name'] = deal_name
         result['title'] = deal_name
+        # Confidence: structured label gets high, bold/subject gets medium
+        if re.search(r'DEAL\s*NAME[:\s]', visible, re.I) or re.search(r'CLO\s+(?:Refi|Reset)', visible, re.I):
+            confidence['deal_name'] = 'high'
+        elif re.search(r'(?:Refinancing|Reset)\s+of\s+', email_text, re.I):
+            confidence['deal_name'] = 'high'
+        else:
+            confidence['deal_name'] = 'medium'
+    else:
+        confidence['deal_name'] = 'missing'
 
     # --- Collateral manager ---
     manager = _extract_manager(visible, email_text)
@@ -503,22 +516,48 @@ def extract_from_email(email_text: str) -> dict:
         short = _lookup_manager_short(manager)
         if short:
             result['collateral_manager_short'] = short
+            confidence['collateral_manager_short'] = 'high'  # from CSV catalog
+        else:
+            confidence['collateral_manager_short'] = 'missing'
+        # Confidence based on extraction method
+        if re.search(r'(?:MANAGER|Collateral\s+Manager):', visible, re.I):
+            confidence['collateral_manager_legal_entity'] = 'high'
+        elif re.search(r'(?:managed|sponsored)\s+by\s+', visible, re.I):
+            confidence['collateral_manager_legal_entity'] = 'high'
+        else:
+            confidence['collateral_manager_legal_entity'] = 'medium'
+    else:
+        confidence['collateral_manager_legal_entity'] = 'missing'
+        confidence['collateral_manager_short'] = 'missing'
 
     # --- Collateral type ---
     ctype = _extract_collateral_type(visible)
     result['deal_type'] = ctype
     result['collateral_type'] = ctype
+    if ctype == 'BSL' and not re.search(r'(?i)senior\s+secured|bank\s+loan|broadly\s+syndicated|BSL', visible):
+        confidence['collateral_type'] = 'low'  # defaulted to BSL
+    else:
+        confidence['collateral_type'] = 'high'
 
     # --- Transaction type ---
     txn_type = _extract_transaction_type(visible)
     if txn_type:
         result['transaction_type'] = txn_type
+        if txn_type == 'New Issue' and not re.search(r'(?i)new\s+issue', visible):
+            confidence['transaction_type'] = 'low'  # defaulted
+        else:
+            confidence['transaction_type'] = 'high'
 
     # --- Status ---
     result['email_type'] = _extract_status(visible).lower()
+    if result['email_type'] in ('priced',):
+        confidence['status'] = 'high'
+    elif re.search(r'(?i)announc|roller', visible):
+        confidence['status'] = 'high'
+    else:
+        confidence['status'] = 'medium'
 
     # --- Placement agent ---
-    # Try explicit text patterns first
     bank_patterns = [
         r'(BNP Paribas|JPMorgan|Jefferies|Bank of America|Citigroup|Morgan Stanley|'
         r'Goldman Sachs|Wells Fargo|Barclays|Deutsche Bank|CIBC|Scotia|Natixis|RBC|'
@@ -526,24 +565,37 @@ def extract_from_email(email_text: str) -> dict:
         r'GreensLedge|Mitsubishi)\s+has\s+priced',
     ]
     agent = _first_match(combined, bank_patterns)
-    # Try legal boilerplate
+    if agent:
+        confidence['arranger'] = 'high'
     if not agent:
         agent = _agent_from_legal_text(visible)
-    # Fallback: sender domain
+        if agent:
+            confidence['arranger'] = 'medium'
     if not agent:
         domain = _extract_sender_domain(email_text)
         if domain:
             agent = _agent_from_domain(domain)
+            if agent:
+                confidence['arranger'] = 'low'
     if agent:
         result['arranger'] = agent
+    else:
+        confidence['arranger'] = 'missing'
 
     # --- Term ---
     term = _extract_term(visible)
     if term:
         result['term'] = term
+        # Direct "5/2" or "3nc1" → high, derived from RP/NC periods → medium
+        if re.search(r'(\d+)\s*/\s*(\d+)\s+(?:transaction|deal|reset|refi)', visible, re.I) or \
+           re.search(r'\d+\s*[Nn][Cc]\s*\d+', visible):
+            confidence['term'] = 'high'
+        else:
+            confidence['term'] = 'medium'
+    else:
+        confidence['term'] = 'missing'
 
     # --- Dates ---
-    # Try filename-based date
     filename = os.getenv('CLO_EMAIL_FILENAME', '')
     m = re.search(r'(\d{4}-\d{2}-\d{2})', filename)
     if m:
@@ -551,8 +603,13 @@ def extract_from_email(email_text: str) -> dict:
         status = result.get('email_type', '')
         if status == 'priced':
             result['priced_date'] = date_str
+            confidence['priced_date'] = 'medium'
         else:
             result['announced_date'] = date_str
+            confidence['announced_date'] = 'medium'
+
+    # Store confidence dict
+    result['_confidence'] = confidence
 
     # --- Map template fields → SharePoint CSV column names ---
     _map_to_csv_columns(result)
